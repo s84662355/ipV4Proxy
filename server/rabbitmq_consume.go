@@ -91,10 +91,22 @@ func (m *manager) runRabbitmqUserInfoQueueConsume(conn *amqp.Connection, ctx con
 		return
 	}
 
-	tcm := taskConsumerManager.New()
-	defer tcm.Stop()
+	if err := ch.Qos(
+		10,    // prefetchCount
+		0,     // prefetchSize
+		false, // global
+	); err != nil {
+		log.Error("[rabbitmq_consume] rabbitmq ch.Qos 错误", zap.Error(err))
+		timeOutCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		<-timeOutCtx.Done()
+		return
+	}
 
-	tcm.AddTask(1, func(ctx context.Context) {
+	wg := sync.WaitGroup{}
+	defer wg.Wait()
+
+	for i := 0; i < 2; i++ {
 		// 从队列中消费消息
 		msgs, err := ch.Consume(
 			q.Name, // 队列名称
@@ -113,14 +125,16 @@ func (m *manager) runRabbitmqUserInfoQueueConsume(conn *amqp.Connection, ctx con
 			return
 		}
 
-		for d := range msgs {
-			log.Printf("Received a message: %s", d.Body)
-		}
+		wg.Add(1)
 
-		timeOutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		<-timeOutCtx.Done()
-	})
+		go func() {
+			defer wg.Done()
+			for d := range msgs {
+				log.Printf("Received a message: %s", d.Body)
+			}
+		}()
+	}
+
 	closeChan := ch.NotifyClose(make(chan *amqp.Error, 1))
 
 	select {
