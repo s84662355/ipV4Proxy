@@ -147,13 +147,13 @@ func (m *manager) httpTcpConn(ctx context.Context, conn net.Conn, req *http.Requ
 
 		domain := domainPointer.Load()
 		if domain != nil && *domain != "" {
-			m.ReportAccessLogToInfluxDB(proxyUserName, *domain, conn.LocalAddr().String())
+			m.ReportAccessLogToInfluxDB(proxyUserName, *domain, proxyServerConn.String())
 		} else {
 			hostArr := strings.Split(address, ":")
 			if cap(hostArr) > 0 {
-				m.ReportAccessLogToInfluxDB(proxyUserName, hostArr[0], conn.LocalAddr().String())
+				m.ReportAccessLogToInfluxDB(proxyUserName, hostArr[0], proxyServerConn.String())
 			} else {
-				m.ReportAccessLogToInfluxDB(proxyUserName, address, conn.LocalAddr().String())
+				m.ReportAccessLogToInfluxDB(proxyUserName, address, proxyServerConn.String())
 			}
 		}
 

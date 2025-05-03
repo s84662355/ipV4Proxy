@@ -149,11 +149,13 @@ func (m *manager) socksTcpConn(ctx context.Context, conn net.Conn) {
 
 		domain := domainPointer.Load()
 		if domain != nil && *domain != "" {
-			m.ReportAccessLogToInfluxDB(user, *domain, conn.LocalAddr().String())
+			m.ReportAccessLogToInfluxDB(user, *domain, proxyServerConn.String())
 		} else {
 			hostArr := strings.Split(destAddr.Address(), ":")
 			if cap(hostArr) > 0 {
-				m.ReportAccessLogToInfluxDB(user, hostArr[0], conn.LocalAddr().String())
+				m.ReportAccessLogToInfluxDB(user, hostArr[0], proxyServerConn.String())
+			} else {
+				m.ReportAccessLogToInfluxDB(user, destAddr.Address(), proxyServerConn.String())
 			}
 		}
 
