@@ -3,7 +3,6 @@ package log
 import (
 	"io"
 	"os"
-	fileP "path/filepath"
 	"time"
 
 	rotatelogs "github.com/lestrrat-go/file-rotatelogs"

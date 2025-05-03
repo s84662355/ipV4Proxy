@@ -1,10 +1,12 @@
 package config
 
 type confData struct {
-	TcpListenerAddress  string
+	TcpListenerAddress  []string
 	GrpcListenerAddress string
-	OneIpMaxConn        int64
 	LogDir              string
+	LocalIp             string
+	ProcessName         string
 	Redis               *redis_config
 	Rabbitmq            *rabbitmq_config
+	Nacos               *nacos_config
 }

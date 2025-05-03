@@ -20,10 +20,12 @@ import (
 var ACK_DATA_NIL = errors.New("ack data nil")
 
 const (
-	DEFAULT_MAX_CONNECTION      = 5  // rabbitMQ tcp 最大连接数
+	DEFAULT_MAX_CONNECTION      = 5  // rabbitmq tcp 最大连接数
 	DEFAULT_MAX_CONSUME_CHANNEL = 25 // 最大消费channel数(一般指消费者)
-	DEFAULT_MAX_CONSUME_RETRY   = 5  // 消费者断线重连最大次数
-	DEFAULT_PUSH_MAX_TIME       = 5  // 最大重发次数
+	DEFAULT_MAX_CONSUME_RETRY   = 10 // 消费者断线重连最大次数
+	DEFAULT_PUSH_MAX_TIME       = 99 // 最大重发次数
+
+	DEFAULT_MAX_PRODUCT_RETRY = 10 // 生产者断线重连最大次数
 
 	// 轮循-连接池负载算法
 	LOAD_BALANCE_ROUND = 1
@@ -33,13 +35,14 @@ const (
 	RABBITMQ_TYPE_PUBLISH = 1 // 生产者
 	RABBITMQ_TYPE_CONSUME = 2 // 消费者
 
-	DEFAULT_RETRY_MIN_RANDOM_TIME = 5000  // 最小重试时间机数
+	DEFAULT_RETRY_MIN_RANDOM_TIME = 5000 // 最小重试时间机数
+
 	DEFAULT_RETRY_MAX_RADNOM_TIME = 15000 // 最大重试时间机数
 
 )
 
 const (
-	EXCHANGE_TYPE_FANOUT = "fanout" // Fanout：广播，将消息交给所有绑定到交换机的队列
+	EXCHANGE_TYPE_FANOUT = "fanout" //  Fanout：广播，将消息交给所有绑定到交换机的队列
 	EXCHANGE_TYPE_DIRECT = "direct" // Direct：定向，把消息交给符合指定routing key 的队列
 	EXCHANGE_TYPE_TOPIC  = "topic"  // Topic：通配符，把消息交给符合routing pattern（路由模式） 的队列
 )
@@ -60,7 +63,7 @@ const (
 )
 
 type RetryClientInterface interface {
-	Push(pushData []byte) *RabbitMQError
+	Push(pushData []byte) *RabbitMqError
 	Ack() error
 }
 
@@ -75,17 +78,18 @@ type retryClient struct {
 	deadExchangeName string
 	deadQueueName    string
 	deadRouteKey     string
-	pool             *RabbitMQPool
+	pool             *RabbitPool
 	receive          *ConsumeReceive
 }
 
-func newRetryClient(channel *amqp.Channel, data *amqp.Delivery, header map[string]interface{}, deadExchangeName string, deadQueueName string, deadRouteKey string, pool *RabbitMQPool, receive *ConsumeReceive) *retryClient {
+func newRetryClient(channel *amqp.Channel, data *amqp.Delivery, header map[string]interface{}, deadExchangeName string, deadQueueName string, deadRouteKey string, pool *RabbitPool, receive *ConsumeReceive) *retryClient {
 	return &retryClient{channel: channel, data: data, header: header, deadExchangeName: deadExchangeName, deadQueueName: deadQueueName, deadRouteKey: deadRouteKey, pool: pool, receive: receive}
 }
 
 func (r *retryClient) Ack() error {
 	// 如果是非自动确认消息 手动进行确认
 	if !r.receive.IsAutoAck {
+
 		if r.data != nil {
 			return r.data.Ack(true)
 		}
@@ -94,7 +98,7 @@ func (r *retryClient) Ack() error {
 	return nil
 }
 
-func (r *retryClient) Push(pushData []byte) *RabbitMQError {
+func (r *retryClient) Push(pushData []byte) *RabbitMqError {
 	if r.channel != nil {
 		var retryNums int32
 		retryNum, ok := r.header["retry_nums"]
@@ -144,18 +148,18 @@ func (r *retryClient) Push(pushData []byte) *RabbitMQError {
 *
 错误返回
 */
-type RabbitMQError struct {
+type RabbitMqError struct {
 	Code    int
 	Message string
 	Detail  string
 }
 
-func (e RabbitMQError) Error() string {
+func (e RabbitMqError) Error() string {
 	return fmt.Sprintf("Exception (%d) Reason: %q", e.Code, e.Message)
 }
 
-func NewRabbitMqError(code int, message string, detail string) *RabbitMQError {
-	return &RabbitMQError{Code: code, Message: message, Detail: detail}
+func NewRabbitMqError(code int, message string, detail string) *RabbitMqError {
+	return &RabbitMqError{Code: code, Message: message, Detail: detail}
 }
 
 /*
@@ -200,7 +204,7 @@ type rConn struct {
 	index int32
 }
 
-type RabbitMQPool struct {
+type RabbitPool struct {
 	minRandomRetryTime int64
 	maxRandomRetryTime int64
 
@@ -222,7 +226,10 @@ type RabbitMQPool struct {
 	consumeReceive      []*ConsumeReceive // 消费者注册事件
 	consumeMaxRetry     int32             // 消费者断线重连最大次数
 	consumeCurrentRetry int32             // 当前重连次数
-	pushCurrentRetry    int32             // 当前推送重连交数
+
+	productMaxRetry     int32 // 生产者重连次数
+	productCurrentRetry int32
+	pushCurrentRetry    int32 // 当前推送重连交数
 
 	clientType int // 客户端类型 生产者或消费者 默认为生产者
 
@@ -241,7 +248,7 @@ type RabbitMQPool struct {
 *
 初始化生产者
 */
-func NewProductPool() *RabbitMQPool {
+func NewProductPool() *RabbitPool {
 	return newRabbitPool(RABBITMQ_TYPE_PUBLISH)
 }
 
@@ -249,12 +256,12 @@ func NewProductPool() *RabbitMQPool {
 *
 初始化消费者
 */
-func NewConsumePool() *RabbitMQPool {
+func NewConsumePool() *RabbitPool {
 	return newRabbitPool(RABBITMQ_TYPE_CONSUME)
 }
 
-func newRabbitPool(clientType int) *RabbitMQPool {
-	return &RabbitMQPool{
+func newRabbitPool(clientType int) *RabbitPool {
+	return &RabbitPool{
 		minRandomRetryTime: DEFAULT_RETRY_MIN_RANDOM_TIME,
 		maxRandomRetryTime: DEFAULT_RETRY_MAX_RADNOM_TIME,
 
@@ -266,6 +273,7 @@ func newRabbitPool(clientType int) *RabbitMQPool {
 		connectionIndex:     0,
 		consumeMaxRetry:     DEFAULT_MAX_CONSUME_RETRY,
 		consumeCurrentRetry: 0,
+		productMaxRetry:     DEFAULT_MAX_PRODUCT_RETRY,
 		pushCurrentRetry:    0,
 		connectStatus:       false,
 		connections:         make(map[int][]*rConn, 2),
@@ -279,7 +287,7 @@ func newRabbitPool(clientType int) *RabbitMQPool {
 *
 设置消费者最大信道数
 */
-func (r *RabbitMQPool) SetMaxConsumeChannel(maxConsume int32) {
+func (r *RabbitPool) SetMaxConsumeChannel(maxConsume int32) {
 	r.consumeMaxChannel = maxConsume
 }
 
@@ -287,7 +295,7 @@ func (r *RabbitMQPool) SetMaxConsumeChannel(maxConsume int32) {
 *
 设置最大连接数
 */
-func (r *RabbitMQPool) SetMaxConnection(maxConnection int32) {
+func (r *RabbitPool) SetMaxConnection(maxConnection int32) {
 	r.maxConnection = maxConnection
 }
 
@@ -296,7 +304,7 @@ func (r *RabbitMQPool) SetMaxConnection(maxConnection int32) {
 设置随时重试时间
 避免同一时刻一次重试过多
 */
-func (r *RabbitMQPool) SetRandomRetryTime(min, max int64) {
+func (r *RabbitPool) SetRandomRetryTime(min, max int64) {
 	r.minRandomRetryTime = min
 	r.maxRandomRetryTime = max
 }
@@ -306,15 +314,15 @@ func (r *RabbitMQPool) SetRandomRetryTime(min, max int64) {
 设置连接池负载算法
 默认轮循
 */
-func (r *RabbitMQPool) SetConnectionBalance(balance int) {
+func (r *RabbitPool) SetConnectionBalance(balance int) {
 	r.connectionBalance = balance
 }
 
-func (r *RabbitMQPool) GetHost() string {
+func (r *RabbitPool) GetHost() string {
 	return r.host
 }
 
-func (r *RabbitMQPool) GetPort() int {
+func (r *RabbitPool) GetPort() int {
 	return r.port
 }
 
@@ -326,13 +334,13 @@ func (r *RabbitMQPool) GetPort() int {
 @param user string 用户名
 @param password 密码
 */
-func (r *RabbitMQPool) Connect(host string, port int, user string, password string) error {
+func (r *RabbitPool) Connect(host string, port int, user string, password string) error {
 	r.host = host
 	r.port = port
 	r.user = user
 	r.password = password
 	r.virtualHost = "/"
-	return r.initConnections()
+	return r.initConnections(false)
 }
 
 /*
@@ -344,20 +352,20 @@ func (r *RabbitMQPool) Connect(host string, port int, user string, password stri
 @param password 密码
 @param virtualHost虚拟机路径
 */
-func (r *RabbitMQPool) ConnectVirtualHost(host string, port int, user string, password string, virtualHost string) error {
+func (r *RabbitPool) ConnectVirtualHost(host string, port int, user string, password string, virtualHost string) error {
 	r.host = host
 	r.port = port
 	r.user = user
 	r.password = password
 	r.virtualHost = virtualHost
-	return r.initConnections()
+	return r.initConnections(false)
 }
 
 /*
 *
 注册消费接收
 */
-func (r *RabbitMQPool) RegisterConsumeReceive(consumeReceive *ConsumeReceive) {
+func (r *RabbitPool) RegisterConsumeReceive(consumeReceive *ConsumeReceive) {
 	if consumeReceive != nil {
 		r.consumeReceive = append(r.consumeReceive, consumeReceive)
 	}
@@ -367,7 +375,7 @@ func (r *RabbitMQPool) RegisterConsumeReceive(consumeReceive *ConsumeReceive) {
 *
 消费者
 */
-func (r *RabbitMQPool) RunConsume() error {
+func (r *RabbitPool) RunConsume() error {
 	r.clientType = RABBITMQ_TYPE_CONSUME
 	if len(r.consumeReceive) == 0 {
 		return errors.New("未注册消费者事件")
@@ -380,8 +388,8 @@ func (r *RabbitMQPool) RunConsume() error {
 *
 发送消息
 */
-func (r *RabbitMQPool) Push(data *RabbitMQData) *RabbitMQError {
-	return rPush(r, data, 1)
+func (r *RabbitPool) Push(data *RabbitMqData) *RabbitMqError {
+	return rPush(r, data, 0)
 }
 
 /*
@@ -389,7 +397,7 @@ func (r *RabbitMQPool) Push(data *RabbitMQData) *RabbitMQError {
 获取当前连接
 1.这里可以做负载算法, 默认使用轮循
 */
-func (r *RabbitMQPool) getConnection() *rConn {
+func (r *RabbitPool) getConnection() *rConn {
 	changeConnectionIndex := r.connectionIndex
 	currentIndex := r.rabbitLoadBalance.RoundRobin(changeConnectionIndex, r.maxConnection)
 	currentNum := currentIndex - changeConnectionIndex
@@ -405,36 +413,51 @@ func (r *RabbitMQPool) getConnection() *rConn {
 3.每个连接池中连接维护一组信道
 @param channelName string 信息道名称
 */
-func (r *RabbitMQPool) getChannelQueue(conn *rConn, exChangeName string, exChangeType string, queueName string, route string, isDead bool, expireTime int) (*rChannel, error) {
+func (r *RabbitPool) getChannelQueue(conn *rConn, exChangeName string, exChangeType string, queueName string, route string, isDead bool, expireTime int) (*rChannel, error) {
+	return r.getChannelQueueReset(conn, exChangeName, exChangeType, queueName, route, isDead, expireTime, false)
+}
+
+func (r *RabbitPool) deleteChannel(conn *rConn, exChangeName string, exChangeType string, queueName string, route string) {
 	channelHashCode := channelHashCode(r.clientType, conn.index, exChangeName, exChangeType, queueName, route)
+	if _, ok := r.channelPool[channelHashCode]; ok {
+		delete(r.channelPool, channelHashCode)
+	}
+}
+
+func (r *RabbitPool) getChannelQueueReset(conn *rConn, exChangeName string, exChangeType string, queueName string, route string, isDead bool, expireTime int, isReset bool) (*rChannel, error) {
+	channelHashCode := channelHashCode(r.clientType, conn.index, exChangeName, exChangeType, queueName, route)
+	if isReset {
+		if _, ok := r.channelPool[channelHashCode]; ok {
+			delete(r.channelPool, channelHashCode)
+		}
+	}
 	if channelQueues, ok := r.channelPool[channelHashCode]; ok {
 		return channelQueues, nil
-	} else {
-		// 如果不存在则创建信道池
-		// 初始化channel
-		rChannel, err := r.initChannels(conn, exChangeName, exChangeType, queueName, route)
-		if err != nil {
-			return nil, err
-		}
-		channel, err := rDeclare(r.clientType, rChannel, exChangeName, exChangeType, queueName, route, isDead, "", "")
-		if err != nil {
-			return nil, err
-		}
-		rChannel.ch = channel.ch
-		r.channelPool[channelHashCode] = rChannel
-		return rChannel, nil
 	}
+	// 初始化channel
+	// fmt.Printf("初始化channel")
+	rChannel, err := r.initChannels(conn, exChangeName, exChangeType, queueName, route)
+	if err != nil {
+		return nil, err
+	}
+	/*channel, err := rDeclare(conn, r.clientType, rChannel, exChangeName, exChangeType, queueName, route, isDead, "", "", "")
+	if err != nil {
+		return nil, err
+	}
+	rChannel.ch = channel.ch*/
+	r.channelPool[channelHashCode] = rChannel
+	return rChannel, nil
 }
 
 /*
 *
 初始化连接池
 */
-func (r *RabbitMQPool) initConnections() error {
+func (r *RabbitPool) initConnections(isLock bool) error {
 	r.connections[r.clientType] = []*rConn{}
 	var i int32 = 0
 	for i = 0; i < r.maxConnection; i++ {
-		itemConnection, err := rConnect(r)
+		itemConnection, err := rConnect(r, isLock)
 		if err != nil {
 			return err
 		} else {
@@ -448,7 +471,7 @@ func (r *RabbitMQPool) initConnections() error {
 *
 初始化信道池
 */
-func (r *RabbitMQPool) initChannels(conn *rConn, exChangeName string, exChangeType string, queueName string, route string) (*rChannel, error) {
+func (r *RabbitPool) initChannels(conn *rConn, exChangeName string, exChangeType string, queueName string, route string) (*rChannel, error) {
 	channel, err := rCreateChannel(conn)
 	if err != nil {
 		return nil, err
@@ -461,12 +484,21 @@ func (r *RabbitMQPool) initChannels(conn *rConn, exChangeName string, exChangeTy
 *
 原rabbitmq连接
 */
-func rConnect(r *RabbitMQPool) (*amqp.Connection, error) {
+func rConnect(r *RabbitPool, islock bool) (*amqp.Connection, error) {
 	virtualHost := "/"
 	if len(strings.TrimSpace(r.virtualHost)) > 0 {
 		virtualHost = r.virtualHost
 	}
-	connectionUrl := fmt.Sprintf("amqp://%s:%s@%s:%d%s", r.user, r.password, r.host, r.port, virtualHost)
+	return connection(r.user, r.password, r.host, r.port, virtualHost)
+}
+
+func connection(user string, password string, host string, port int, vHost string) (*amqp.Connection, error) {
+	virtualHost := "/"
+	if len(strings.TrimSpace(vHost)) > 0 {
+		virtualHost = vHost
+	}
+	connectionUrl := fmt.Sprintf("amqp://%s:%s@%s:%d%s", user, password, host, port, virtualHost)
+	// fmt.Println(connectionUrl)
 	client, err := amqp.Dial(connectionUrl)
 	if err != nil {
 		return nil, err
@@ -489,6 +521,7 @@ func rCreateChannel(conn *rConn) (*amqp.Channel, error) {
 /*
 *
 绑定并声明
+@param rconn *rConn tcp连接对象
 @param clientType int 客户端类型
 @param channel 信道
 @param exChangeName 交换机名称
@@ -498,14 +531,14 @@ func rCreateChannel(conn *rConn) (*amqp.Channel, error) {
 @param isDeadQueue 是否是死信队列
 @param deadQueueExpireTime int 死信队列到期时间
 */
-func rDeclare(clientType int, channel *rChannel, exChangeName string, exChangeType string, queueName string, route string, isDeadQueue bool, oldExChangeName string, oldRoute string) (*rChannel, error) {
+func rDeclare(rconn *rConn, clientType int, channel *rChannel, exChangeName string, exChangeType string, queueName string, route string, isDeadQueue bool, oldExChangeName string, oldQueueName, oldRoute string) (*rChannel, error) {
 	if clientType == RABBITMQ_TYPE_PUBLISH {
 		if (len(exChangeType) == 0) || (exChangeType != EXCHANGE_TYPE_DIRECT && exChangeType != EXCHANGE_TYPE_FANOUT && exChangeType != EXCHANGE_TYPE_TOPIC) {
 			return channel, errors.New("交换机类型错误")
 		}
 	}
 	newChannel := channel.ch
-	err := newChannel.ExchangeDeclare(exChangeName, exChangeType, true, false, false, false, nil)
+	err := newChannel.ExchangeDeclare(exChangeName, exChangeType, false, false, false, false, nil)
 	if err != nil {
 		return nil, errors.New(fmt.Sprintf("MQ注册交换机失败:%s", err))
 	}
@@ -513,9 +546,13 @@ func rDeclare(clientType int, channel *rChannel, exChangeName string, exChangeTy
 		argsQue := make(map[string]interface{})
 		if isDeadQueue {
 			argsQue["x-dead-letter-exchange"] = oldExChangeName
-			argsQue["x-dead-letter-routing-key"] = oldRoute
+			oldRoute = strings.TrimSpace(oldRoute)
+			if len(oldRoute) > 0 {
+				argsQue["x-dead-letter-routing-key"] = oldRoute
+			}
 		}
-		queue, err := newChannel.QueueDeclare(queueName, true, false, false, false, argsQue)
+		argsQue["x-message-ttl"] = 5000
+		queue, err := newChannel.QueueDeclare(queueName, false, true, false, false, argsQue)
 		if err != nil {
 			return nil, errors.New(fmt.Sprintf("MQ注册队列失败:%s", err))
 		}
@@ -532,9 +569,9 @@ func rDeclare(clientType int, channel *rChannel, exChangeName string, exChangeTy
 *
 消费者处理
 */
-func rConsume(pool *RabbitMQPool) {
+func rConsume(pool *RabbitPool) {
 	for _, v := range pool.consumeReceive {
-		go func(pool *RabbitMQPool, receive *ConsumeReceive) {
+		go func(pool *RabbitPool, receive *ConsumeReceive) {
 			rListenerConsume(pool, receive)
 		}(pool, v)
 	}
@@ -542,6 +579,7 @@ func rConsume(pool *RabbitMQPool) {
 	创建一个协程监听任务
 	*/
 	select {
+	// case data := <-pool.errorChanel:
 	case <-pool.errorChanel:
 		statusLock.Lock()
 		status = true
@@ -554,18 +592,18 @@ func rConsume(pool *RabbitMQPool) {
 *
 重连处理
 */
-func retryConsume(pool *RabbitMQPool) {
-	fmt.Printf("2秒后开始重试:[%d]\n", pool.consumeCurrentRetry)
+func retryConsume(pool *RabbitPool) {
+	log(fmt.Sprintf("2秒后开始重试:[%d]", pool.consumeCurrentRetry))
 	atomic.AddInt32(&pool.consumeCurrentRetry, 1)
 	time.Sleep(time.Second * 2)
-	_, err := rConnect(pool)
+	_, err := rConnect(pool, true)
 	if err != nil {
 		retryConsume(pool)
 	} else {
 		statusLock.Lock()
 		status = false
 		statusLock.Unlock()
-		_ = pool.initConnections()
+		_ = pool.initConnections(false)
 		rConsume(pool)
 	}
 }
@@ -574,21 +612,22 @@ func retryConsume(pool *RabbitMQPool) {
 *
 监听消费
 */
-func rListenerConsume(pool *RabbitMQPool, receive *ConsumeReceive) {
+func rListenerConsume(pool *RabbitPool, receive *ConsumeReceive) {
 	var i int32 = 0
 	for i = 0; i < pool.consumeMaxChannel; i++ {
-		go func(num int32, p *RabbitMQPool, r *ConsumeReceive) {
+		itemI := i
+		go func(num int32, p *RabbitPool, r *ConsumeReceive) {
 			consumeTask(num, p, r)
-		}(i, pool, receive)
+		}(itemI, pool, receive)
 	}
 }
 
 var (
 	statusLock sync.Mutex
-	status     = false
+	status     bool = false
 )
 
-func setConnectError(pool *RabbitMQPool, code int, message string) {
+func setConnectError(pool *RabbitPool, code int, message string) {
 	statusLock.Lock()
 	defer statusLock.Unlock()
 
@@ -601,11 +640,11 @@ func setConnectError(pool *RabbitMQPool, code int, message string) {
 	status = true
 }
 
-/*
-**
+/***
 消费任务
 */
-func consumeTask(num int32, pool *RabbitMQPool, receive *ConsumeReceive) {
+
+func consumeTask(num int32, pool *RabbitPool, receive *ConsumeReceive) {
 	// 获取请求连接
 	closeFlag := false
 	pool.connectionLock.Lock()
@@ -623,17 +662,21 @@ func consumeTask(num int32, pool *RabbitMQPool, receive *ConsumeReceive) {
 		_ = channel.Close()
 		_ = conn.conn.Close()
 	}()
-
+	// defer
 	notifyClose := make(chan *amqp.Error)
 	closeChan := make(chan *amqp.Error, 1)
-	rChannels := &rChannel{ch: channel, index: num}
-	deadRChannels := &rChannel{ch: channel, index: num}
+	rChanels := &rChannel{ch: channel, index: num}
+	deadRChanels := &rChannel{ch: channel, index: num}
 
 	deadExchangeName := fmt.Sprintf("%s-%s", receive.ExchangeName, "dead")
 	deadQueueName := fmt.Sprintf("%s-%s", receive.QueueName, "dead")
-	deadRouteKey := fmt.Sprintf("%s-%s", receive.Route, "dead")
+	deadRouteKey := ""
+	if len(receive.Route) > 0 {
+		deadRouteKey = fmt.Sprintf("%s-%s", receive.Route, "dead")
+	}
 
-	rChannels, err = rDeclare(pool.clientType, rChannels, receive.ExchangeName, receive.ExchangeType, receive.QueueName, receive.Route, false, "", "")
+	// rChanels, err = rDeclare(conn, pool.clientType, rChanels, receive.ExchangeName, receive.ExchangeType, receive.QueueName, receive.Route, receive.IsDead, receive.DeadExchangeName, receive.DeadQueueName, receive.DeadRoute)
+	rChanels, err = rDeclare(conn, pool.clientType, rChanels, receive.ExchangeName, receive.ExchangeType, receive.QueueName, receive.Route, false, "", "", "")
 	// 如果存在死信队列 则需要声明
 	if receive.IsTry {
 		if num%2 == 0 {
@@ -649,7 +692,7 @@ func consumeTask(num int32, pool *RabbitMQPool, receive *ConsumeReceive) {
 				_ = deadChannel.Close()
 			}()
 
-			deadRChannels, err = rDeclare(pool.clientType, deadRChannels, deadExchangeName, EXCHANGE_TYPE_DIRECT, deadQueueName, deadRouteKey, true, receive.ExchangeName, receive.Route)
+			deadRChanels, err = rDeclare(conn, pool.clientType, deadRChanels, deadExchangeName, EXCHANGE_TYPE_DIRECT, deadQueueName, deadRouteKey, true, receive.ExchangeName, receive.QueueName, receive.Route)
 		}
 	}
 	if err != nil {
@@ -712,6 +755,13 @@ func consumeTask(num int32, pool *RabbitMQPool, receive *ConsumeReceive) {
 								expirationTime = 5000
 							}
 
+							//var reTryBody []byte
+							//if len(reTryByte) == 0 {
+							//	reTryBody = data.Body
+							//} else {
+							//	reTryBody = reTryByte
+							//}
+
 							err = channel.Publish(deadExchangeName, deadRouteKey, false, false, amqp.Publishing{
 								ContentType:  "text/plain",
 								Body:         data.Body,
@@ -728,7 +778,7 @@ func consumeTask(num int32, pool *RabbitMQPool, receive *ConsumeReceive) {
 			if receive.EventFail != nil {
 				receive.EventFail(RCODE_CONNECTION_ERROR, NewRabbitMqError(RCODE_CONNECTION_ERROR, fmt.Sprintf("消息处理中断: queue:%s\n", receive.QueueName), e.Error()), nil)
 			}
-			setConnectError(pool, e.Code, fmt.Sprintf("消息处理中断: %s", e.Error()))
+			setConnectError(pool, e.Code, fmt.Sprintf("消息处理中断: %s \n", e.Error()))
 			closeFlag = true
 		}
 		if closeFlag {
@@ -739,27 +789,58 @@ func consumeTask(num int32, pool *RabbitMQPool, receive *ConsumeReceive) {
 
 /*
 *
+获取生产者连接
+*/
+func tryConn(pool *RabbitPool, rc *rConn, currentTry int, isRetry bool, exchangeName string, exchangeType string, queueName string, route string) (*rConn, bool) {
+	tryStatus := false
+	if isRetry {
+		tryStatus = true
+		log("连接中断,2秒后开始重试")
+		atomic.AddInt32(&pool.productCurrentRetry, 1)
+		time.Sleep(time.Second * 2)
+	}
+	if rc == nil {
+		rc = pool.getConnection()
+	}
+	if rc.conn == nil || rc.conn.IsClosed() {
+		log("开始尝试重试连接")
+		var err error
+		pool.deleteChannel(rc, exchangeName, exchangeType, queueName, route)
+		rc.conn, err = connection(pool.user, pool.password, pool.host, pool.port, pool.virtualHost)
+		if err != nil {
+			tryConn(pool, rc, currentTry, true, exchangeName, exchangeType, queueName, route)
+		}
+	}
+	return rc, tryStatus
+}
+
+/*
+*
 发送消息
 */
-func rPush(pool *RabbitMQPool, data *RabbitMQData, sendTime int) *RabbitMQError {
+func rPush(pool *RabbitPool, data *RabbitMqData, sendTime int) *RabbitMqError {
 	if sendTime >= pool.pushMaxTime {
 		return NewRabbitMqError(RCODE_PUSH_MAX_ERROR, "重试超过最大次数", "")
 	}
 	pool.channelLock.Lock()
 	conn := pool.getConnection()
-	rChannel, err := pool.getChannelQueue(conn, data.ExchangeName, data.ExchangeType, data.QueueName, data.Route, false, 0)
+	conn, isTry := tryConn(pool, conn, 0, false, data.ExchangeName, data.ExchangeType, data.QueueName, data.Route)
+	rChannels, err := pool.getChannelQueueReset(conn, data.ExchangeName, data.ExchangeType, data.QueueName, data.Route, false, 0, isTry)
 	pool.channelLock.Unlock()
 	if err != nil {
-		fmt.Println(err)
+		// fmt.Println(err)
 		return NewRabbitMqError(RCODE_GET_CHANNEL_ERROR, "获取信道失败", err.Error())
 	} else {
-		err = rChannel.ch.Publish(data.ExchangeName, data.Route, false, false, amqp.Publishing{
-			ContentType:  "text/plain",
+		err = rChannels.ch.Publish(data.ExchangeName, data.QueueName, false, false, amqp.Publishing{
+			ContentType:  "application/octet-stream",
 			Body:         data.Data,
 			DeliveryMode: amqp.Persistent, // 持久化到磁盘
+			Timestamp:    time.Now(),
+			MessageId:    data.MessageId,
 		})
-		if err != nil {
-			// 如果消息发送失败, 休息两秒重发
+		if err != nil { // 如果消息发送失败, 重试发送
+			// pool.channelLock.Unlock()
+			// 如果没有发送成功,休息两秒重发
 			time.Sleep(time.Second * 2)
 			sendTime++
 			return rPush(pool, data, sendTime)
@@ -814,9 +895,9 @@ func RandomNum(length int) string {
 
 func RandomAround(min, max int64) (int64, error) {
 	if min > max {
-		return 0, errors.New("the min is greater than max")
+		return 0, errors.New("the min is greater than max!")
 	}
-
+	// rand.Seed(time.Now().UnixNano())
 	if min < 0 {
 		f64Min := math.Abs(float64(min))
 		i64Min := int64(f64Min)
@@ -827,4 +908,14 @@ func RandomAround(min, max int64) (int64, error) {
 		result, _ := rand2.Int(rand2.Reader, big.NewInt(max-min+1))
 		return min + result.Int64(), nil
 	}
+}
+
+var (
+	UTFALL_SECOND = "2006-01-02 15:04:05"
+	cstZone       = time.FixedZone("CST", 8*3600)
+)
+
+func log(message string) {
+	times := time.Now().In(cstZone).Format(UTFALL_SECOND)
+	fmt.Printf("%s %s\n", times, message)
 }

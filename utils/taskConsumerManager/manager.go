@@ -26,6 +26,12 @@ func (m *Manager) Context() context.Context {
 type taskFunc func(context.Context)
 
 func (m *Manager) AddTask(count int, fc taskFunc) {
+	select {
+	case <-m.ctx.Done():
+		return
+	default:
+	}
+
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()

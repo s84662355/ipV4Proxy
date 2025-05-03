@@ -7,7 +7,8 @@ import (
 	_ "net/http/pprof"
 	"runtime"
 	"time"
-	"transparent/log"
+
+	"proxy_server/log"
 )
 
 func gohttp() {

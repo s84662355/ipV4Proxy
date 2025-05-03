@@ -5,12 +5,13 @@ package rabbitMQ
 发送数据
 消息发送
 */
-type RabbitMQData struct {
+type RabbitMqData struct {
 	ExchangeName string // 交换机名称
 	ExchangeType string // 交换机类型 见RabbitmqPool.go 常量
 	QueueName    string // 队列名称
 	Route        string // 路由
 	Data         []byte // 发送数据
+	MessageId    string
 }
 
 /*
@@ -22,13 +23,14 @@ type RabbitMQData struct {
 @param route string 路由
 @param data string 发送的数据
 */
-func GetRabbitMqDataFormat(exChangeName string, exChangeType string, queueName string, route string, data []byte) *RabbitMQData {
-	return &RabbitMQData{
+func GetRabbitMqDataFormat(exChangeName string, exChangeType string, queueName string, route string, data []byte, messageId string) *RabbitMqData {
+	return &RabbitMqData{
 		ExchangeName: exChangeName,
 		ExchangeType: exChangeType,
 		QueueName:    queueName,
 		Route:        route,
 		Data:         data,
+		MessageId:    messageId,
 	}
 }
 
@@ -42,8 +44,8 @@ func GetRabbitMqDataFormat(exChangeName string, exChangeType string, queueName s
 @param route string 路由
 @param data string 发送的数据
 */
-func GetRabbitMqDataFormatExpire(exChangeName string, exChangeType string, queueName string, route string, data []byte) *RabbitMQData {
-	return &RabbitMQData{
+func GetRabbitMqDataFormatExpire(exChangeName string, exChangeType string, queueName string, route string, data []byte) *RabbitMqData {
+	return &RabbitMqData{
 		ExchangeName: exChangeName,
 		ExchangeType: exChangeType,
 		QueueName:    queueName,

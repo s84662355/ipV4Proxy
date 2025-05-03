@@ -4,10 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"sync"
 	"sync/atomic"
-
-	"github.com/spf13/viper"
 )
 
 var confDataInstancePointer atomic.Pointer[confData]

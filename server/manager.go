@@ -2,25 +2,24 @@ package server
 
 import (
 	"context"
-	"encoding/json"
-	"flag"
-	"io/ioutil"
+	"fmt"
 	"net"
-	"os"
-	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/orcaman/concurrent-map/v2"
-	"go.uber.org/zap" // 高性能日志库
-	"proxy_server/protobuf"
+	"github.com/spf13/viper"
 
 	"google.golang.org/grpc"
-	"proxy_server/log"
+
+	"proxy_server/protobuf"
+	"proxy_server/utils/Queue"
+	"proxy_server/utils/rabbitMQ"
 	"proxy_server/utils/taskConsumerManager"
 )
 
-const acceptAmount = 16
+const AcceptAmount = 8
 
 // 使用 sync.OnceValue 确保 manager 只被初始化一次（线程安全）
 var newManager = sync.OnceValue(func() *manager {
@@ -33,7 +32,7 @@ var newManager = sync.OnceValue(func() *manager {
 	m.bytePool = sync.Pool{
 		// 当池为空时，使用 New 函数创建新对象
 		New: func() interface{} {
-			return make([]byte, 1024)
+			return make([]byte, 2*1024)
 		},
 	}
 
@@ -43,22 +42,35 @@ var newManager = sync.OnceValue(func() *manager {
 // manager 结构体管理整个代理服务的核心组件
 type manager struct {
 	protobuf.UnimplementedAuthServer
-	tcm            *taskConsumerManager.Manager // 任务调度管理器
-	tcpListener    net.Listener
-	grpcServer     *grpc.Server
-	grpcListener   net.Listener
-	isRun          atomic.Bool
-	bytePool       sync.Pool
-	ipConnCountMap cmap.ConcurrentMap[string, *IpConnCountMapData]
-	userCtxMap     cmap.ConcurrentMap[string, *connContext]
+	tcm                            *taskConsumerManager.Manager // 任务调度管理器
+	tcpListener                    map[string]net.Listener
+	grpcServer                     *grpc.Server
+	grpcListener                   net.Listener
+	isRun                          atomic.Bool
+	bytePool                       sync.Pool
+	ipConnCountMap                 cmap.ConcurrentMap[string, *IpConnCountMapData]
+	userCtxMap                     cmap.ConcurrentMap[string, *connContext]
+	nacosConfig                    *NacosConfig
+	nacosConfigMu                  sync.RWMutex
+	viperClient                    *viper.Viper
+	blackMap                       atomic.Pointer[map[string]struct{}]
+	rabbitmqSendQueueSlices        []Queue.Queue[*rabbitMQ.RabbitMqData]
+	rabbitmqSendQueueSlicesCounter atomic.Uint64
+	rabbitmqSendQueueDone          chan struct{}
+	nacosRespChan                  <-chan bool
 }
 
 // Start 启动代理服务的各个组件
 func (m *manager) Start() error {
+	m.nacosConfig = &NacosConfig{}
+	m.initNacosConf()
 	m.initTcpListener()
+	m.initRabbitmqSendQueueSlices()
 
-	m.tcm.AddTask(acceptAmount, m.tcpAccept)
-	m.tcm.AddTask(1, m.runGrpcServer)
+	m.tcm.AddTask(AcceptAmount, m.tcpAccept)
+	// m.tcm.AddTask(1, m.runGrpcServer)
+	m.tcm.AddTask(1, m.runNacosConfServer)
+	m.tcm.AddTask(1, m.runRabbitmqConsume)
 
 	return nil
 }
@@ -66,39 +78,42 @@ func (m *manager) Start() error {
 // Stop 停止所有服务组件
 func (m *manager) Stop() {
 	m.isRun.Store(false)
-	m.tcpListener.Close()
+	for _, v := range m.tcpListener {
+		v.Close()
+	}
 	m.tcm.Stop() // 停止任务消费者管理器，会触发所有任务的优雅关闭
+	m.closeRabbitmqSendQueueSlices()
 }
 
-func (m *manager) AddIpConnCount(ip string) bool {
-	ok := false
+func (m *manager) AddIpConnCount(ip string) (ok bool, ipCount int64) {
 	m.ipConnCountMap.Upsert(
 		ip, nil,
 		func(exist bool, valueInMap *IpConnCountMapData, newValue *IpConnCountMapData) *IpConnCountMapData {
 			if exist {
-				conf := config.GetConf()
-				if conf.OneIpMaxConn != 0 && valueInMap.count.Load() >= conf.OneIpMaxConn {
+				conf := m.getNacosConf()
+				if conf.OneIpMaxConn != 0 && valueInMap.count.Load() >= int64(conf.OneIpMaxConn) {
+					ipCount = valueInMap.count.Load()
 					return valueInMap
 				}
-				valueInMap.count.Add(1)
+				ipCount = valueInMap.count.Add(1)
 				ok = true
 				return valueInMap
 			}
 
-			valueInMap := &IpConnCountMapData{}
-			valueInMap.count.Add(1)
+			valueInMap = &IpConnCountMapData{}
+			ipCount = valueInMap.count.Add(1)
 			ok = true
 			return valueInMap
 		})
 
-	return ok
+	return
 }
 
 func (m *manager) ReduceIpConnCount(ip string) {
 	m.ipConnCountMap.RemoveCb(
 		ip,
 		func(key string, valueInMap *IpConnCountMapData, exists bool) bool {
-			if exist {
+			if exists {
 				if valueInMap.count.Add(-1) == 0 {
 					return true
 				}
@@ -107,23 +122,24 @@ func (m *manager) ReduceIpConnCount(ip string) {
 		})
 }
 
-func (m *Manager) addUserConnection(k string) *connContext {
+func (m *manager) addUserConnection(k string) *connContext {
 	return m.userCtxMap.Upsert(k, nil, func(exist bool, valueInMap *connContext, newValue *connContext) *connContext {
 		if exist {
 			valueInMap.c++
 			return valueInMap
 		}
+		conf := m.getNacosConf()
 		ctx, cancel := context.WithCancel(m.tcm.Context())
 		return &connContext{
 			ctx:    ctx,
 			cancel: cancel,
 			c:      1,
-			// a:      io.NewLimitedReaderAction(ctx,conf.Conf.LimitedReader.ReadRate, conf.Conf.LimitedReader.ReadBurst),
+			a:      NewLimitedReaderAction(conf.LimitedReader.ReadRate, conf.LimitedReader.ReadBurst),
 		}
 	})
 }
 
-func (m *Manager) deleteUserConnection(k string, ctx *connContext) {
+func (m *manager) deleteUserConnection(k string, ctx *connContext) {
 	m.userCtxMap.RemoveCb(k, func(key string, valueInMap *connContext, exists bool) bool {
 		if exists {
 			if valueInMap != ctx {
@@ -141,7 +157,7 @@ func (m *Manager) deleteUserConnection(k string, ctx *connContext) {
 	})
 }
 
-func (m *Manager) CloseUserConnections(k string) error {
+func (m *manager) CloseUserConnections(k string) error {
 	v, exist := m.userCtxMap.Pop(k)
 
 	if exist && v != nil {
@@ -150,4 +166,33 @@ func (m *Manager) CloseUserConnections(k string) error {
 	}
 
 	return fmt.Errorf("CloseUserConnections userCtxMap %s 不存在", k)
+}
+
+func (m *manager) SetBlackMap(bm map[string]struct{}) {
+	m.blackMap.Store(&bm)
+}
+
+func (m *manager) GetBlackMap() *map[string]struct{} {
+	return m.blackMap.Load()
+}
+
+func (m *manager) IsInBlacklist(d string) (string, bool) {
+	bm := m.blackMap.Load()
+	if bm == nil {
+		return "", false
+	}
+	blackMap := *bm
+
+	_, ok := blackMap[d]
+	if ok {
+		return d, true
+	}
+
+	for vv := range blackMap {
+		if strings.Contains(d, vv) {
+			return vv, true
+		}
+	}
+
+	return "", false
 }

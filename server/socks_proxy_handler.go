@@ -1,19 +1,30 @@
 package server
 
 import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"go.uber.org/zap"
 
 	"proxy_server/log"
-	"proxy_server/util/socks5"
+	"proxy_server/server/sniffing"
+	"proxy_server/server/sniffing/tls"
+	"proxy_server/utils/socks5"
 )
 
 func (m *manager) socksTcpConn(ctx context.Context, conn net.Conn) {
 	// 读取账号密码
 	var user, pwd string
-	user, pwd, err = socks5.GetUserPassword(conn)
+	user, pwd, err := socks5.GetUserPassword(conn)
 	if err != nil {
 		log.Error("[socks_proxy_handler] 读取账号密码错误", zap.Error(err))
 		if _, err = conn.Write([]byte{socks5.UserAuthVersion, socks5.AuthFailure}); err != nil {
@@ -26,7 +37,7 @@ func (m *manager) socksTcpConn(ctx context.Context, conn net.Conn) {
 	proxyServerIpStr := proxyServerConn.IP.String()
 	proxyServerIpByte := proxyServerConn.IP.To4()
 
-	_, err = m.proxyAuth.Valid(ctx, user, pwd, proxyServerIpStr)
+	_, err = m.Valid(ctx, user, pwd, proxyServerIpStr)
 	if err != nil {
 		log.Error("[socks_proxy_handler] 鉴权失败", zap.Error(err), zap.Any("user", user), zap.Any("pwd", pwd), zap.Any("ip", proxyServerIpStr))
 		if _, err = conn.Write([]byte{socks5.UserAuthVersion, socks5.AuthFailure}); err != nil {
@@ -35,12 +46,22 @@ func (m *manager) socksTcpConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	if m.AddIpConnCount(proxyServerIpStr) {
+	if ok, ipCount := m.AddIpConnCount(proxyServerIpStr); ok {
 		defer m.ReduceIpConnCount(proxyServerIpStr)
+	} else {
+		// ip的连接数到达上限
+		log.Error("[socks_proxy_handler] ip连接数达到上限", zap.Any("ip", proxyServerIpStr), zap.Any("连接数", ipCount), zap.Any("user", user))
+		resp := socks5.ConnectionRefused
+		if err = socks5.SendReply(conn, resp, nil); err != nil {
+			return
+		}
+		return
+
 	}
 
 	///认证成功，返回消息给客户端
 	if _, err = conn.Write([]byte{socks5.UserAuthVersion, socks5.AuthSuccess}); err != nil {
+		log.Error("[socks_proxy_handler] 认证成功，返回消息给客户端失败", zap.Any("ip", proxyServerIpStr), zap.Any("user", user))
 		return
 	}
 
@@ -55,8 +76,23 @@ func (m *manager) socksTcpConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	domain := regexpDomain(destAddr.Address())
+	if domain != "" {
+		if black, in := m.IsInBlacklist(domain); in {
+			m.SendBlackListAccessLogMessageData(user, pwd, black, 1, user, proxyServerIpStr)
+			log.Error("[socks_proxy_handler] 黑名单", zap.Any("domain", domain), zap.Any("local_ip", proxyServerIpStr), zap.Any("target_addr", destAddr.Address()), zap.Any("user", user))
+			if err = socks5.SendReply(conn, socks5.HostUnreachable, nil); err != nil {
+				return
+			}
+		}
+		return
+	}
+
+	var domainPointer atomic.Pointer[string]
+	domainPointer.Store(&domain)
+
 	var target net.Conn
-	target, err = DialContext("tcp", destAddr.Address(), time.Second*10, proxyServerIpByte, 0)
+	target, err = DialContext(ctx, "tcp", destAddr.Address(), time.Second*10, proxyServerIpByte, 0)
 	if err != nil {
 		log.Error("[socks_proxy_handler] DialContext 创建目标连接失败", zap.Error(err))
 		msg := err.Error()
@@ -91,54 +127,150 @@ func (m *manager) socksTcpConn(ctx context.Context, conn net.Conn) {
 
 	key := fmt.Sprintf("%s:%s", user, proxyServerIpStr)
 	connCtx := m.addUserConnection(key)
-	// action := connCtx.a
+	action := connCtx.a
 	defer m.deleteUserConnection(key, connCtx)
 
 	netConn := newConn(conn, CONN_WRITE_TIME, CONN_READ_TIME)
 	netTarget := newConn(target, CONN_WRITE_TIME, CONN_READ_TIME)
 
-	///////////////////////
-	////黑名单逻辑
-	//		level.Info(m.logger).Log(LOG_PRE, fmt.Sprintf("%s start to transport!", s5LogPre), LOG_MESSAGE, fmt.Sprintf("s5_proxy_ip:[%s] - clientAddr:[%s] - username:[%s] - target_host:[%s]", proxyServerIpStr, clientAddr, user, serverName))
-
-	//////////////////////
-
-	///go rabbitmq.ReportAccessLogToInfluxDB(user, serverName, conn.LocalAddr().String()) // 访问数据插入时序数据库
+	byteChan := make(chan []byte, 1)
+	defer close(byteChan)
 
 	errCh := make(chan error, 2)
 	defer close(errCh)
 
+	done := make(chan struct{})
 	wg := sync.WaitGroup{}
-	defer wg.Wait()
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, err := io.CopyBuffer(netTarget, io.NewLimitedReader(netConn, action), make([]byte, 2*1024))
-		errCh <- err
-	}()
+	defer func() {
+		close(done)
+		netConn.Close()
+		netTarget.Close()
+		domainPointer.Load()
 
-	go func() {
-		defer wg.Done()
-		_, err := io.CopyBuffer(netConn, io.NewLimitedReader(netTarget, action), make([]byte, 2*1024))
-		errCh <- err
-	}()
-
-	select {
-	case err, _ := <-errCh:
-		if err != nil {
-			log.Error("[socks_proxy_handler] conn close!",
-				zap.Error(err),
-				zap.Any("username", user),
-				zap.Any("clientAddr", clientAddr),
-				zap.Any("target_host", serverName),
-			)
+		domain := domainPointer.Load()
+		if domain != nil && *domain != "" {
+			m.ReportAccessLogToInfluxDB(user, *domain, conn.LocalAddr().String())
+		} else {
+			hostArr := strings.Split(destAddr.Address(), ":")
+			if cap(hostArr) > 0 {
+				m.ReportAccessLogToInfluxDB(user, hostArr[0], conn.LocalAddr().String())
+			}
 		}
-	case <-ctx.Done():
 
-	case <-connCtx.ctx.Done():
+		wg.Wait()
+	}()
+
+	///域名为空，并且使用CONNECT
+	if domain == "" {
+		readWriterNotice, err := sniffing.NewReadWriterNotice(
+			netConn,
+			nil,
+			func(buf []byte) {
+				byteChan <- buf
+			})
+		if err != nil {
+			return
+		}
+		netConn = readWriterNotice
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case <-done:
+				return
+			case buf, ok := <-byteChan:
+				if len(buf) > 0 && ok {
+
+					// 如果数据的第一个字节是 0x16，可能是 TLS 握手的 ClientHello 消息
+					if buf[0] == 0x16 {
+						// 创建一个 ClientHelloMsg 实例
+						clientHelloMsg := tls.ClientHelloMsg{}
+						// 尝试将负载数据反序列化为 ClientHelloMsg 实例
+						clientHelloMsg.UnmarshalByByte(buf)
+						// 如果反序列化后得到了 ServerName
+						if clientHelloMsg.ServerName != "" {
+							domainPointer.Store(&clientHelloMsg.ServerName)
+							return
+						}
+					}
+
+					// 解析 HTTP 请求
+					hr, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(buf)))
+					// 如果解析成功
+					if err == nil {
+						// 从 HTTP 请求头中获取 Host 字段作为 ServerName
+						ServerName := hr.Header.Get("Host")
+						if ServerName != "" {
+							domainPointer.Store(&ServerName)
+							return
+						}
+
+					}
+
+					ServerName := regexpDomain(string(buf))
+
+					if ServerName != "" {
+						domainPointer.Store(&ServerName)
+					}
+				}
+			}
+		}()
 
 	}
 
-	target.Close()
-	conn.Close()
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := io.CopyBuffer(netTarget, NewLimitedReader(connCtx.ctx, netConn, action), make([]byte, 2*1024))
+		errCh <- err
+	}()
+
+	go func() {
+		defer wg.Done()
+		_, err := io.CopyBuffer(netConn, NewLimitedReader(connCtx.ctx, netTarget, action), make([]byte, 2*1024))
+		errCh <- err
+	}()
+
+	loopTime := 30 * time.Second
+	ticker := time.NewTicker(loopTime)
+	defer ticker.Stop()
+
+	for {
+		ticker.Reset(loopTime)
+		select {
+
+		case <-ticker.C:
+			domain := domainPointer.Load()
+			if domain != nil && *domain != "" {
+				if black, in := m.IsInBlacklist(*domain); in {
+					m.SendBlackListAccessLogMessageData(user, pwd, black, 1, user, proxyServerIpStr)
+					log.Error("[socks_proxy_handler] 黑名单定时检测",
+						zap.Any("domain", domain),
+						zap.Error(err),
+						zap.Any("username", user),
+						zap.Any("clientAddr", proxyServerIpStr),
+						zap.Any("target_host", destAddr.Address()),
+					)
+
+					return
+				}
+			}
+		case err, _ := <-errCh:
+			if err != nil {
+				log.Error("[socks_proxy_handler] conn close!",
+					zap.Error(err),
+					zap.Any("username", user),
+					zap.Any("clientAddr", proxyServerIpStr),
+					zap.Any("target_host", destAddr.Address()),
+				)
+			}
+
+			return
+		case <-ctx.Done():
+			return
+		case <-connCtx.ctx.Done():
+			return
+
+		}
+	}
 }

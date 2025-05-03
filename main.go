@@ -2,11 +2,16 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
+	"time"
 
 	"go.uber.org/zap"
+
+	"proxy_server/config"
 	"proxy_server/log"
 	"proxy_server/server"
 )
@@ -20,7 +25,7 @@ func init() {
 	fmt.Println(configPath)
 
 	config.Load(configPath)
-	log.Init(filepath.Join(config.GetConf().LogDir, config.ServiceName, mark))
+	log.Init(filepath.Join(config.GetConf().LogDir))
 	go gohttp()
 }
 
@@ -31,8 +36,7 @@ func main() {
 	if err != nil {
 		// 启动失败记录致命错误并退出
 		log.Fatal("服务器启动失败",
-			zap.String("error", err.Error()),
-			zap.String("version", version))
+			zap.String("error", err.Error()))
 		return
 	}
 
@@ -52,22 +56,12 @@ func main() {
 	signal.Notify(signalChan,
 		syscall.SIGINT,
 		syscall.SIGTERM,
-		os.Kill)
+		os.Kill,
+	)
 
-	// 初始时间间隔为 30 秒
-	interval := 30 * time.Second
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		ticker.Reset(interval)
-		select {
-		case <-ticker.C:
-			config.Load(configPath)
-			// 3. 主线程阻塞等待终止信号
-		case <-signalChan: // 当接收到上述任意信号时继续执行
-			return
-		}
-
-	}
+	<-signalChan // 当接收到上述任意信号时继续执行
+	time.AfterFunc(5*time.Second, func() {
+		log.Info("程序强制关闭")
+		os.Exit(1)
+	})
 }
