@@ -85,7 +85,7 @@ func (m *manager) runRabbitmqDeleteUserDataQueueConsumeAction(ctx context.Contex
 	keysToDelete := []string{strKey, setKey}
 
 	// 删除多个键
-	_, err = common.GetRedisDB().Del(ctx, keysToDelete...).Result()
+	_, err = common.GetRedisDB().Del(context.Background(), keysToDelete...).Result()
 	if err != nil {
 		log.Error("[rabbitmq_consume] rabbitmq DeleteUserData 删除数据错误", zap.Error(err))
 		return
