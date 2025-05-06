@@ -1,7 +1,7 @@
 package config
 
 type confData struct {
-	TcpListenerAddress  []string
+	TcpListenerAddress  []string /// [":2423",":5467"]
 	GrpcListenerAddress string
 	LogDir              string
 	LocalIp             string

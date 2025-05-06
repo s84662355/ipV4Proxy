@@ -59,8 +59,23 @@ func (m *manager) tcpListenerAccept(ctx context.Context, tcpListener net.Listene
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer conn.Close()
-			m.handlerTcpConn(ctx, conn)
+			done := make(chan struct{})
+			defer func() {
+				conn.Close()
+				for range done {
+				}
+			}()
+
+			go func() {
+				defer close(done)
+				m.handlerTcpConn(ctx, conn)
+			}()
+
+			select {
+			case <-ctx.Done():
+			case <-done:
+			}
 		}()
+
 	}
 }

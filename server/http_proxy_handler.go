@@ -115,9 +115,23 @@ func (m *manager) httpTcpConn(ctx context.Context, conn net.Conn, req *http.Requ
 			log.Error("[tcp_conn_handler] 清除Proxy-Authorization", zap.Error(err))
 			return
 		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			select {
+			case <-ctx.Done():
+				target.Close()
+			case done <- struct{}{}:
+			}
+		}()
+
 		if _, err := target.Write(buf.Bytes()); err != nil {
+			for range done {
+			}
 			log.Error("[tcp_conn_handler] 转发http请求数据失败", zap.Error(err))
 			return
+		}
+		for range done {
 		}
 
 	}
